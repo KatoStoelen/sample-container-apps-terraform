@@ -10,7 +10,7 @@ using System.Text.Json;
 // ARGUMENTS
 ///////////////////////////////////////////////////////////////////////////////
 
-var _target = Argument("target", "Zip-Artifacts");
+var _target = Argument("target", "Publish");
 var _configuration = Argument("configuration", "Debug");
 var _containerRegistry = Argument("container-registry", string.Empty);
 var _pushImages = Argument("push-images", false);
@@ -196,7 +196,7 @@ Task("Docker-Build")
     .Does(() =>
 {
     var dockerfilesToBuild = GetFiles($"{_artifactsDir}/**/Dockerfile");
-    var tags = new[] { _commitSha, _version };
+    var tags = new[] { $"{_version}-{_buildCounter}" };
 
     foreach (var dockerfile in dockerfilesToBuild)
     {
@@ -228,6 +228,7 @@ Task("Docker-Build")
 
 Task("Docker-Push")
     .WithCriteria(_pushImages)
+    .IsDependentOn("Docker-Login")
     .IsDependentOn("Docker-Build")
     .Does(() =>
 {
@@ -267,6 +268,10 @@ Task("Docker-CleanUp")
             },
             imageId);
     }
+
+    Info($"Logout from container registry {_containerRegistry}");
+
+    DockerLogout(_containerRegistry);
 });
 
 Task("CI")

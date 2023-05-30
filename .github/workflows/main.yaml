@@ -1,0 +1,231 @@
+name: CI/CD
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      build-configuration:
+        description: Dotnet build configuration
+        required: false
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      cake-verbosity:
+        description: Cake build verbosity
+        required: false
+        type: choice
+        options:
+          - Normal
+          - Verbose
+          - Diagnostic
+        default: Normal
+      dotnet-verbosity:
+        description: Dotnet verbosity
+        required: false
+        type: choice
+        options:
+          - Quiet
+          - Minimal
+          - Normal
+          - Detailed
+          - Diagnostic
+        default: Minimal
+
+env:
+  build-configuration: ${{ inputs.build-configuration || 'Release' }}
+  cake-verbosity: ${{ inputs.cake-verbosity || 'Normal' }}
+  dotnet-verbosity: ${{ inputs.dotnet-verbosity || 'Minimal' }}
+
+jobs:
+  changes:
+    name: Determine changes made
+    runs-on: ubuntu-latest
+    outputs:
+      is-aca-infra-changed: ${{ steps.detect-changes.outputs.aca-infra }}
+      is-registry-infra-changed: ${{ steps.detect-changes.outputs.registry-infra }}
+      is-apps-changed: ${{ steps.detect-changes.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v2
+        id: detect-changes
+        with:
+          filters: |
+            aca-infra:
+              - infrastructure/modules/**
+              - infrastructure/aca/**
+            registry-infra:
+              - infrastructure/registry/**
+            apps:
+              - ./*.sln
+              - build/**
+              - ./**/Directory.Build.props
+              - src/**
+
+  acr:
+    name: Provision Azure Container Registry
+    needs: changes
+    runs-on: ubuntu-latest
+    concurrency: provision-acr
+    outputs:
+      acr-resource-id-enc: ${{ steps.encrypt-acr-id.outputs.result }}
+      acr-login-server: ${{ fromJson(steps.terraform-acr.outputs.terraform-output-json).acr_login_server.value }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Provision Azure Container Registry
+        uses: ./.github/templates/terraform
+        id: terraform-acr
+        with:
+          working-directory: ./infrastructure/registry
+          backend-resource-group: ${{ vars.COMMON_RESOURCE_GROUP_NAME }}
+          backend-storage-account: ${{ secrets.TF_COMMON_STORAGE_ACCOUNT_NAME }}
+          apply: ${{ needs.changes.outputs.is-registry-infra-changed }}
+          vars: resource_group_name=${{ vars.COMMON_RESOURCE_GROUP_NAME }}
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      # acr_id contains Azure subscription ID which is a repository secret
+      # Since GitHub won't output the raw value from this job, encrypt the value to share it with other jobs
+      - name: Encrypt ACR resource ID
+        id: encrypt-acr-id
+        env:
+          RESOURCE_ID: ${{ fromJson(steps.terraform-acr.outputs.terraform-output-json).acr_id.value }}
+          PASSPHRASE: ${{ secrets.SOME_PASSPHRASE }}
+        run: |
+          ENCRYPTED=$(echo -n "$RESOURCE_ID" | gpg --symmetric --quiet --batch --passphrase "$PASSPHRASE" --output - | base64 -w0)
+          echo "result=$ENCRYPTED" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build apps
+    needs: acr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      app-version: ${{ fromJson(steps.cake.outputs.cake-output-json).version }}
+      api-image: ${{ fromJson(fromJson(steps.cake.outputs.cake-output-json).images).myapi[0] }}
+      worker-image: ${{ fromJson(fromJson(steps.cake.outputs.cake-output-json).images).myworker[0] }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Run Cake build
+        uses: ./.github/templates/cake
+        id: cake
+        with:
+          script-path: ./build/build.cake
+          args: >
+            --target=CI
+            --verbosity ${{ env.cake-verbosity }}
+            --dotnet-verbosity=${{ env.dotnet-verbosity }}
+            --configuration=${{ env.build-configuration }}
+            --container-registry=${{ needs.acr.outputs.acr-login-server }}
+            --push-images=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+            --build-counter=${{ github.run_number }}
+        env:
+          CONTAINER_REGISTRY_USERNAME: ${{ secrets.ARM_CLIENT_ID }}
+          CONTAINER_REGISTRY_PASSWORD: ${{ secrets.ARM_CLIENT_SECRET }}
+
+      - name: Tag commit
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          VERSION=${{ fromJson(steps.cake.outputs.cake-output-json).version }}
+          COMMIT=$GITHUB_SHA
+
+          echo "Tag commit $COMMIT with version $VERSION"
+
+          git tag -a $VERSION -m "Tag v${VERSION}" $COMMIT
+          git push --tags
+
+  deploy-staging:
+    name: Deploy apps to Staging
+    needs: [changes, acr, build]
+    if: needs.changes.outputs.is-aca-infra-changed == 'true' || needs.changes.outputs.is-apps-changed == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency: deploy-staging
+    steps:
+      - name: Decrypt ACR resource ID
+        id: decrypt-acr-id
+        env:
+          RESOURCE_ID_ENC: ${{ needs.acr.outputs.acr-resource-id-enc }}
+          PASSPHRASE: ${{ secrets.SOME_PASSPHRASE }}
+        run: |
+          DECRYPTED=$(echo -n "$RESOURCE_ID_ENC" | base64 -d | gpg --decrypt --quiet --batch --passphrase "$PASSPHRASE" --output -)
+          echo "result=$DECRYPTED" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v3
+
+      - name: Provision Azure Container Apps
+        uses: ./.github/templates/terraform
+        with:
+          working-directory: ./infrastructure/aca
+          backend-resource-group: ${{ vars.RESOURCE_GROUP_NAME }}
+          backend-storage-account: ${{ secrets.TF_STORAGE_ACCOUNT_NAME }}
+          apply: true
+          vars: |-
+            resource_group_name=${{ vars.RESOURCE_GROUP_NAME }}
+            acr_resource_id=${{ steps.decrypt-acr-id.outputs.result }}
+            acr_login_server=${{ needs.acr.outputs.acr-login-server }}
+            api_container_image=${{ needs.build.outputs.api-image }}
+            worker_container_image=${{ needs.build.outputs.worker-image }}
+            revision_suffix=${{ needs.build.outputs.app-version }}
+          var-files: config.staging.tfvars
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+  deploy-prod:
+    name: Deploy apps to Prod
+    needs: [changes, acr, build, deploy-staging]
+    if: needs.changes.outputs.is-aca-infra-changed == 'true' || needs.changes.outputs.is-apps-changed == 'true'
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency: deploy-prod
+    steps:
+      - name: Decrypt ACR resource ID
+        id: decrypt-acr-id
+        env:
+          RESOURCE_ID_ENC: ${{ needs.acr.outputs.acr-resource-id-enc }}
+          PASSPHRASE: ${{ secrets.SOME_PASSPHRASE }}
+        run: |
+          DECRYPTED=$(echo -n "$RESOURCE_ID_ENC" | base64 -d | gpg --decrypt --quiet --batch --passphrase "$PASSPHRASE" --output -)
+          echo "result=$DECRYPTED" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v3
+
+      - name: Provision Azure Container Apps
+        uses: ./.github/templates/terraform
+        with:
+          working-directory: ./infrastructure/aca
+          backend-resource-group: ${{ vars.RESOURCE_GROUP_NAME }}
+          backend-storage-account: ${{ secrets.TF_STORAGE_ACCOUNT_NAME }}
+          apply: true
+          vars: |-
+            resource_group_name=${{ vars.RESOURCE_GROUP_NAME }}
+            acr_resource_id=${{ steps.decrypt-acr-id.outputs.result }}
+            acr_login_server=${{ needs.acr.outputs.acr-login-server }}
+            api_container_image=${{ needs.build.outputs.api-image }}
+            worker_container_image=${{ needs.build.outputs.worker-image }}
+            revision_suffix=${{ needs.build.outputs.app-version }}
+          var-files: config.prod.tfvars
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}

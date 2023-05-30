@@ -23,3 +23,7 @@ var host = Host.CreateDefaultBuilder(args)
     .Build();
 
 host.Run();
+
+internal sealed partial class Program
+{
+}

@@ -1,3 +1,4 @@
+environment_name = "staging"
 container_specs = {
   api = {
     cpu    = 0.25
@@ -8,4 +9,4 @@ container_specs = {
     memory = "0.5Gi"
   }
 }
-aca_env_log_retention_in_days = 7
+aca_env_log_retention_in_days = 30

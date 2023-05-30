@@ -19,7 +19,7 @@ variable "aca_env_short_name" {
   description = "The short name of the Azure Container Apps Environment. Full name will be [aca_env_short_name]-[environment_name]-cae"
 }
 
-variable "aca_env_log_retention_in_days" {
+variable "log_retention_in_days" {
   type        = number
   description = "The number of days to keep logs in the ACA Log Analytics Workspace"
 }

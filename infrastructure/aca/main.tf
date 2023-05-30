@@ -31,7 +31,7 @@ data "azurerm_resource_group" "resource_group" {
   name = var.resource_group_name
 }
 
-resource "azurerm_user_assigned_identity" "user_assigned_identity" {
+resource "azurerm_user_assigned_identity" "aca_id" {
   name                = "acatest-${var.environment_name}-id"
   resource_group_name = data.azurerm_resource_group.resource_group.name
   location            = data.azurerm_resource_group.resource_group.location
@@ -40,7 +40,7 @@ resource "azurerm_user_assigned_identity" "user_assigned_identity" {
 resource "azurerm_role_assignment" "acr_pull_role" {
   role_definition_name = "AcrPull"
   scope                = var.acr_resource_id
-  principal_id         = azurerm_user_assigned_identity.managed_identity.principal_id
+  principal_id         = azurerm_user_assigned_identity.aca_id.principal_id
 }
 
 module "azure_container_apps" {
@@ -51,7 +51,9 @@ module "azure_container_apps" {
   location            = data.azurerm_resource_group.resource_group.location
   environment_name    = var.environment_name
 
-  user_assigned_identity_id       = azurerm_user_assigned_identity.user_assigned_identity.id
+  log_retention_in_days = var.aca_env_log_retention_in_days
+
+  user_assigned_identity_id       = azurerm_user_assigned_identity.aca_id.id
   container_registry_login_server = var.acr_login_server
 
   container_apps = [

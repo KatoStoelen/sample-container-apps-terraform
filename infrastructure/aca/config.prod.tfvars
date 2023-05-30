@@ -1,3 +1,4 @@
+environment_name = "prod"
 container_specs = {
   api = {
     cpu    = 0.25

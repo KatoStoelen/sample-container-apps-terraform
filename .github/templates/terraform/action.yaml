@@ -1,0 +1,79 @@
+name: Run Terraform
+description: |
+  Template for running Terraform. Expects ARM_CLIENT_ID, ARM_CLIENT_SECRET,
+  ARM_TENANT_ID and ARM_SUBSCRIPTION_ID environment variables to be set.
+
+inputs:
+  working-directory:
+    description: A directory containing a Terraform main.tf file
+  backend-storage-account:
+    description: Name of storage account used for Terraform state
+  backend-resource-group:
+    description: Name of resource group containing Storage Account for Terraform state
+  plan:
+    description: Whether or not to run Terraform plan
+  apply:
+    description: Whether or not to run Terraform apply. When true, Terraform plan will also run
+  vars:
+    description: Variables to pass to the Terraform module. Format (key=value). Multiple variables must be separated by newline.
+  var-files:
+    description: Path to tfvars file(s) to load variables from. Multiple files must be separated by newline.
+
+outputs:
+  terraform-output-json:
+    description: Output of the Terraform module as JSON
+    value: ${{ steps.terraform-output.outputs.stdout }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.4.x
+
+    - name: Terraform init
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      run: >
+        terraform init
+        --backend-config="storage_account_name=${{ inputs.backend-storage-account }}"
+        --backend-config="resource_group_name=${{ inputs.backend-resource-group }}"
+
+    - name: Convert variables to Terraform plan arguments
+      id: vars-to-args
+      if: inputs.plan == 'true' || inputs.apply == 'true'
+      shell: pwsh
+      env:
+        VARS: ${{ inputs.vars }}
+        VAR_FILES: ${{ inputs.var-files }}
+      run: |
+        $varArgs = if ($env:VARS) { ($env:VARS -split "[\r\n]+" | ForEach-Object { "-var='$_'" }) -join ' ' }
+        $varFileArgs = if ($env:VAR_FILES) { ($env:VAR_FILES -split "[\r\n]+" | ForEach-Object { "-var-file='$_'" }) -join ' ' }
+
+        Write-Output "var-args=$varArgs" >> $env:GITHUB_OUTPUT
+        Write-Output "var-file-args=$varFileArgs" >> $env:GITHUB_OUTPUT
+
+    - name: Terraform plan
+      if: inputs.plan == 'true' || inputs.apply == 'true'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      run: >
+        terraform plan
+        ${{ steps.vars-to-args.outputs.var-args }}
+        ${{ steps.vars-to-args.outputs.var-file-args }}
+        -no-color
+        -out=plan.tfplan
+        -input=false
+
+    - name: Terraform apply
+      if: inputs.apply == 'true'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      run: terraform apply plan.tfplan
+
+    - name: Terraform outputs
+      id: terraform-output
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      run: terraform output -json
