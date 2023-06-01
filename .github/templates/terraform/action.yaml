@@ -14,6 +14,8 @@ inputs:
     description: Whether or not to run Terraform plan
   apply:
     description: Whether or not to run Terraform apply. When true, Terraform plan will also run
+  destroy:
+    description: Whether or not to run Terrafomr destroy.
   vars:
     description: Variables to pass to the Terraform module. Format (key=value). Multiple variables must be separated by newline.
   var-files:
@@ -42,7 +44,7 @@ runs:
 
     - name: Convert variables to Terraform plan arguments
       id: vars-to-args
-      if: inputs.plan == 'true' || inputs.apply == 'true'
+      if: (inputs.plan == 'true' || inputs.apply == 'true') && inputs.destroy != 'true'
       shell: pwsh
       env:
         VARS: ${{ inputs.vars }}
@@ -55,7 +57,7 @@ runs:
         Write-Output "var-file-args=$varFileArgs" >> $env:GITHUB_OUTPUT
 
     - name: Terraform plan
-      if: inputs.plan == 'true' || inputs.apply == 'true'
+      if: (inputs.plan == 'true' || inputs.apply == 'true') && inputs.destroy != 'true'
       working-directory: ${{ inputs.working-directory }}
       shell: bash
       run: >
@@ -67,10 +69,16 @@ runs:
         -input=false
 
     - name: Terraform apply
-      if: inputs.apply == 'true'
+      if: inputs.apply == 'true' && inputs.destroy != 'true'
       working-directory: ${{ inputs.working-directory }}
       shell: bash
       run: terraform apply plan.tfplan
+
+    - name: Terraform destroy
+      if: inputs.destroy == 'true'
+      working-directory: ${{ inputs.working-directory }}
+      shell: bash
+      run: terraform destroy -auto-approve -input=false
 
     - name: Terraform outputs
       id: terraform-output
